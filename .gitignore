@@ -11,3 +11,6 @@ data/
 
 # Editor
 .vscode/
+
+data/
+*.csv
