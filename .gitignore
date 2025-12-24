@@ -1,0 +1,13 @@
+# Python junk
+__pycache__/
+*.pyc
+
+# Secrets
+.env
+
+# Generated runtime artifacts
+cache/
+data/
+
+# Editor
+.vscode/

@@ -1,0 +1,10 @@
+services:
+  app:
+    build: .
+    working_dir: /app
+    volumes:
+      - ./:/app
+    env_file:
+      - .env
+    environment:
+      - PYTHONUNBUFFERED=1
