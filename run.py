@@ -32,10 +32,25 @@ DEBUG = True  # Set to True for verbose output
 # Woot settings
 WOOT_MAX_ITEMS = 10  # Max items to scan from Woot (default)
 
+# Curated categories for "scan all" mode (edit this list to change which categories are scanned)
+WOOT_ALL_CATEGORIES = [
+    'Tools',
+    'Electronics',
+    'Computers',
+    'Home',
+    'Sports',
+    'Automotive'
+]
+
 # eBay search settings
-EBAY_FEE_RATE = 0.15
-SHIPPING_BUFFER = 10
-MISC_BUFFER = 2
+EBAY_FEE_RATE = 0.15  # Legacy, kept for backward compatibility
+SHIPPING_BUFFER = 10  # Legacy, kept for backward compatibility
+MISC_BUFFER = 2  # Legacy, kept for backward compatibility
+
+# Fee model for net profit calculation
+EBAY_FEE_PCT = 0.1325  # 13.25% eBay final value fee
+PAYMENT_FEE_PCT = 0.03  # 3% payment processing fee
+SHIPPING_FLAT = 9.99  # Flat shipping cost assumption
 MIN_DELAY_SEC = 10.0
 RETRY_DELAYS = [30, 90]  # seconds for rate limit retries
 CACHE_TTL_SECONDS = 24 * 3600  # 24 hours (legacy, use get_cache_ttl() for status-based TTLs)
@@ -47,6 +62,30 @@ CACHE_VERSION = 2  # Increment to invalidate old cache entries
 MIN_PROFIT = 20
 MIN_ROI = 0.25
 MIN_SOLD_COUNT = 5
+
+# Keyword denylist (items with these keywords are skipped before eBay analysis)
+# Note: Multi-word phrases should come before single words that are part of them
+# (e.g., 'air filter' before 'filter')
+DENYLIST_KEYWORDS = [
+    # Clothing/baby items
+    'baby', 'kids', 'toddler', 'infant', 'socks', 'clothing', 'shirt', 'bodysuit', 'underwear',
+    # Size/variant-heavy items (phrases first, then single words)
+    'air filter', 'storage bin', 'wall mount', 'led strip', 'cabinet pull',
+    'filter', 'merv', 'hvac', 'organizer', 'bins', 'tote', 
+    'shelf', 'rack', 'holder', 'curtain', 'lights'
+]
+
+# Allowlist for /feed/all category (only items matching these keywords will be analyzed)
+# Used to prevent budget waste on non-flip-friendly items (beauty, supplements, seasonal, etc.)
+ALL_FEED_ALLOWLIST = [
+    # Brands
+    'milwaukee', 'dewalt', 'makita', 'ryobi', 'bosch', 'ridgid', 'kobalt', 'craftsman',
+    'ego', 'greenworks', 'husky', 'klein', 'fluke', 'dremel',
+    # Tool types/features
+    'wobble', 'impact', 'drill', 'saw', 'grinder', 'ratchet', 'socket',
+    'wrench', 'tool', 'battery', 'charger', 'vacuum', 'blower', 'pressure washer',
+    'compressor', 'generator', 'router', 'sander', 'multimeter', 'tester', 'laser', 'level'
+]
 
 # HTTP settings
 USER_AGENT = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
@@ -1695,50 +1734,110 @@ def search_ebay_sold(query: str, no_retry: bool = False, original_title: Optiona
 # CALCULATIONS AND FILTERING
 # ============================================================================
 
-def calculate_metrics(buy_price: float, expected_sale_price: float, trimmed_count: int) -> Dict:
+def evaluate_deal(net_profit: float, net_roi: float, trimmed_count: int, min_net_profit: float, min_net_roi: float, min_sold_comps: int) -> Tuple[str, Optional[str]]:
+    """
+    Evaluate deal against thresholds. Returns (status, fail_reason).
+    status is 'PASS', 'FAIL', or 'SKIP'
+    fail_reason is None for PASS, otherwise a short code with measured vs required values.
+    """
+    fails = []
+    if net_profit < min_net_profit:
+        fails.append(f"FAIL_MIN_NET_PROFIT ({net_profit:.2f} < {min_net_profit:.2f})")
+    if net_roi < min_net_roi:
+        fails.append(f"FAIL_MIN_NET_ROI ({net_roi:.3f} < {min_net_roi:.3f})")
+    if trimmed_count < min_sold_comps:
+        fails.append(f"FAIL_MIN_COMPS ({trimmed_count} < {min_sold_comps})")
+    
+    if fails:
+        return ('FAIL', "; ".join(fails))
+    return ('PASS', None)
+
+def calculate_metrics(buy_price: float, expected_sale_price: float, trimmed_count: int, min_profit: Optional[float] = None, min_roi: Optional[float] = None, min_sold_comps: Optional[int] = None, ebay_fee_pct: float = EBAY_FEE_PCT, payment_fee_pct: float = PAYMENT_FEE_PCT, shipping_flat: float = SHIPPING_FLAT) -> Dict:
     """Calculate arbitrage metrics using expected sale price (median) and determine PASS/FAIL."""
-    # Calculate fees and costs based on expected sale price
+    # Use provided thresholds or fall back to global constants
+    effective_min_profit = min_profit if min_profit is not None else MIN_PROFIT
+    effective_min_roi = min_roi if min_roi is not None else MIN_ROI
+    effective_min_sold_comps = min_sold_comps if min_sold_comps is not None else MIN_SOLD_COUNT
+    
+    # Calculate net profit: gross_profit - fees - shipping
+    gross_profit = expected_sale_price - buy_price
+    fees = expected_sale_price * (ebay_fee_pct + payment_fee_pct)
+    net_profit = gross_profit - fees - shipping_flat
+    net_roi = net_profit / buy_price if buy_price > 0 else 0
+    
+    # Legacy calculations (kept for backward compatibility)
     ebay_fees = expected_sale_price * EBAY_FEE_RATE
-    total_costs = buy_price + SHIPPING_BUFFER + MISC_BUFFER + ebay_fees
     net_sale = expected_sale_price - ebay_fees - SHIPPING_BUFFER - MISC_BUFFER
     profit = net_sale - buy_price
     roi = profit / buy_price if buy_price > 0 else 0
     
-    # Apply filters
-    fails = []
-    if profit < MIN_PROFIT:
-        fails.append(f"Profit ${profit:.2f} < ${MIN_PROFIT}")
-    if roi < MIN_ROI:
-        fails.append(f"ROI {roi:.2%} < {MIN_ROI:.0%}")
-    if trimmed_count < MIN_SOLD_COUNT:
-        fails.append(f"Trimmed count {trimmed_count} < {MIN_SOLD_COUNT}")
-    
-    passed = len(fails) == 0
-    fail_reason = "; ".join(fails) if fails else None
+    # Evaluate deal against thresholds
+    status, fail_reason = evaluate_deal(net_profit, net_roi, trimmed_count, effective_min_profit, effective_min_roi, effective_min_sold_comps)
+    passed = (status == 'PASS')
     
     return {
-        'net_sale': net_sale,
-        'profit': profit,
-        'roi': roi,
+        'gross_profit': gross_profit,
+        'fees': fees,
+        'net_profit': net_profit,
+        'net_roi': net_roi,
+        'net_sale': net_sale,  # Legacy
+        'profit': profit,  # Legacy
+        'roi': roi,  # Legacy
         'passed': passed,
-        'fail_reason': fail_reason
+        'fail_reason': fail_reason,
+        'status': 'passed' if status == 'PASS' else 'failed'  # 'passed' or 'failed'
     }
 
 # ============================================================================
 # MAIN EXECUTION
 # ============================================================================
 
-def process_woot_mode(category: str = 'Tools', limit: int = 10, resume: bool = False, stream: bool = False) -> List[Dict]:
+def process_woot_mode(category: str = 'Tools', limit: int = 10, resume: bool = False, stream: bool = False, brands: Optional[str] = None, mode: str = 'conservative', ebay_fee_pct: float = EBAY_FEE_PCT, payment_fee_pct: float = PAYMENT_FEE_PCT, shipping_flat: float = SHIPPING_FLAT) -> List[Dict]:
     """
     Process Woot deals (default mode). Returns list of result dictionaries.
     
     Args:
-        category: Woot category to fetch
+        category: Woot category to fetch (single category or comma-separated list, e.g. "Tools,Electronics")
         limit: Max items to fetch
         resume: If True, only process items from deals.json where status='pending' and ebay_* is None
+        stream: If True, stream results live
+        brands: Comma-separated list of brands to filter (case-insensitive)
+        mode: Scan mode ('conservative', 'active', or 'highticket')
+        ebay_fee_pct: eBay fee percentage (default: EBAY_FEE_PCT)
+        payment_fee_pct: Payment processing fee percentage (default: PAYMENT_FEE_PCT)
+        shipping_flat: Flat shipping cost (default: SHIPPING_FLAT)
     """
+    # Parse categories if comma-separated
+    categories = [c.strip() for c in category.split(',') if c.strip()]
+    is_multi_category = len(categories) > 1
+    
+    # Parse brands if provided
+    brand_list = None
+    if brands:
+        brand_list = [b.strip().lower() for b in brands.split(',') if b.strip()]
+    
+    # Determine thresholds based on mode (using net profit/ROI)
+    if mode == 'active':
+        scan_min_net_profit = 10.0
+        scan_min_net_roi = 0.20
+        scan_min_sold_comps = 8
+    elif mode == 'highticket':
+        scan_min_net_profit = 15.0
+        scan_min_net_roi = 0.10
+        scan_min_sold_comps = 8
+    else:  # conservative (default)
+        scan_min_net_profit = MIN_PROFIT
+        scan_min_net_roi = MIN_ROI
+        scan_min_sold_comps = 12
+    
     print("=" * 80)
     print("Woot → eBay Sold Arbitrage Checker")
+    print(f"Mode: {mode} (min net profit ${scan_min_net_profit:.0f}, min net ROI {scan_min_net_roi:.0%}, min sold comps {scan_min_sold_comps})")
+    if is_multi_category:
+        print(f"Categories: {', '.join(categories)}")
+    if brand_list:
+        print(f"Brand filter: {', '.join(brand_list)}")
+    print(f"Fee settings: ebay_fee_pct={ebay_fee_pct:.4f}, payment_fee_pct={payment_fee_pct:.4f}, shipping_flat=${shipping_flat:.2f}")
     print("=" * 80)
     print()
     
@@ -1765,21 +1864,197 @@ def process_woot_mode(category: str = 'Tools', limit: int = 10, resume: bool = F
         fetched_count = len(woot_items)
     else:
         # Normal mode: Fetch Woot deals
-        print(f"Fetching Woot deals (category: {category}, limit: {limit})...")
-        woot_items = fetch_woot_deals(category=category, limit=limit)
-        
-        if not woot_items:
-            print("ERROR: Could not fetch Woot deals from API!")
-            return []
-        
-        fetched_count = len(woot_items)
-        print(f"Fetched {fetched_count} items from Woot")
-        print()
+        # Special handling for "all" category (only when it's a single category, not comma-separated)
+        if not is_multi_category and categories[0].lower() == 'all':
+            # Increase fetch batch when --brands is provided to find more brand matches
+            fetch_limit = 2000 if brand_list else 500
+            print(f"Fetching Woot deals (category: all, fetching {fetch_limit} items for filtering)...")
+            all_items = fetch_woot_deals(category='all', limit=fetch_limit)
+            # Attach source_category to each item
+            if all_items:
+                for item in all_items:
+                    item['source_category'] = 'all'
+            
+            if not all_items:
+                print("ERROR: Could not fetch Woot deals from API!")
+                return []
+            
+            print(f"Fetched {len(all_items)} items from /feed/all")
+            print(f"Pre-filtering to find eligible items (applying filters before eBay analysis)...")
+            
+            # Pre-filter: apply non-eBay filters to find eligible items
+            eligible_items = []
+            pre_filtered_nonflippable = 0
+            pre_skipped_low_asp = 0
+            pre_skipped_keyword = 0
+            pre_skipped_low_confidence = 0
+            pre_skipped_allowlist = 0
+            pre_skipped_brand = 0
+            
+            for item in all_items:
+                parsed_item = parse_woot_item(item)
+                if not parsed_item:
+                    continue
+                
+                title = parsed_item['title']
+                sale_price = parsed_item['sale_price']
+                url = parsed_item['url']
+                item_category = parsed_item.get('category')
+                condition = parsed_item.get('condition')
+                
+                title_lower = title.lower()
+                
+                # Apply allowlist filter (only for /feed/all to prevent budget waste)
+                # Bypass allowlist if --brands is provided (brands become the allowlist)
+                if not brand_list:
+                    if not any(keyword in title_lower for keyword in ALL_FEED_ALLOWLIST):
+                        pre_skipped_allowlist += 1
+                        continue
+                
+                # Apply brand filter if specified
+                if brand_list:
+                    if not any(brand in title_lower for brand in brand_list):
+                        pre_skipped_brand += 1
+                        continue
+                
+                # Apply pre-eBay filters
+                if is_non_flippable(title, condition, item_category):
+                    pre_filtered_nonflippable += 1
+                    continue
+                
+                if sale_price < 20.00:
+                    pre_skipped_low_asp += 1
+                    continue
+                
+                if any(keyword in title_lower for keyword in DENYLIST_KEYWORDS):
+                    pre_skipped_keyword += 1
+                    continue
+                
+                # Check low confidence skip
+                confidence_info = build_query_confidence(title)
+                query_confidence = confidence_info['confidence']
+                LOW_CONFIDENCE_PRICE_THRESHOLD = 30.0
+                if query_confidence == "low" and sale_price < LOW_CONFIDENCE_PRICE_THRESHOLD:
+                    pre_skipped_low_confidence += 1
+                    continue
+                
+                # Check filter size requirement
+                if is_filter_like(title):
+                    woot_size = extract_filter_size(title)
+                    if woot_size is None:
+                        # Needs size - skip in pre-filter
+                        continue
+                
+                # Item passed all pre-eBay filters - add to eligible list
+                eligible_items.append(item)
+            
+            filter_parts = [f"{pre_filtered_nonflippable} non-flippable", f"{pre_skipped_low_asp} <$20", f"{pre_skipped_keyword} keyword denylist", f"{pre_skipped_low_confidence} low confidence"]
+            if brand_list:
+                # When --brands is provided, allowlist is bypassed
+                if pre_skipped_brand > 0:
+                    filter_parts.append(f"{pre_skipped_brand} brand filter")
+            else:
+                # When --brands is not provided, show allowlist filter
+                filter_parts.append(f"{pre_skipped_allowlist} all-feed allowlist")
+            print(f"  Pre-filtered: {', '.join(filter_parts)}")
+            print(f"  Eligible items: {len(eligible_items)}")
+            
+            # Take first --limit items from eligible items
+            woot_items = eligible_items[:limit]
+            if len(eligible_items) < limit:
+                print(f"  Note: Only {len(eligible_items)} eligible items found (requested {limit})")
+            
+            fetched_count = len(all_items)
+            print(f"Proceeding with {len(woot_items)} items for eBay analysis")
+            print()
+        else:
+            # Normal category: fetch with limit as before
+            # Handle multiple categories if comma-separated
+            if is_multi_category:
+                print(f"Fetching Woot deals from {len(categories)} categories: {', '.join(categories)}...")
+                all_fetched_items = []
+                for cat in categories:
+                    items = fetch_woot_deals(category=cat, limit=limit)
+                    if items:
+                        # Attach source_category to each item
+                        for item in items:
+                            item['source_category'] = cat
+                        all_fetched_items.extend(items)
+                        print(f"  Fetched {len(items)} items from {cat}")
+                
+                if not all_fetched_items:
+                    print("ERROR: Could not fetch Woot deals from API!")
+                    return []
+                
+                print(f"Combined {len(all_fetched_items)} items from all categories")
+                
+                # De-duplicate by URL (or title+url) before filtering
+                seen_urls = set()
+                seen_title_urls = set()
+                deduplicated_items = []
+                duplicates_count = 0
+                
+                for item in all_fetched_items:
+                    parsed_item = parse_woot_item(item)
+                    if not parsed_item:
+                        continue
+                    
+                    url = parsed_item.get('url')
+                    title = parsed_item.get('title', '').strip().lower()
+                    
+                    is_duplicate = False
+                    
+                    # Primary de-duplication: by URL (most reliable)
+                    if url:
+                        if url in seen_urls:
+                            is_duplicate = True
+                        else:
+                            seen_urls.add(url)
+                    
+                    # Secondary de-duplication: by title+url combination (for additional safety)
+                    if url and title and not is_duplicate:
+                        title_url_key = f"{title}|||{url}"
+                        if title_url_key in seen_title_urls:
+                            is_duplicate = True
+                        else:
+                            seen_title_urls.add(title_url_key)
+                    
+                    if is_duplicate:
+                        duplicates_count += 1
+                        continue
+                    
+                    deduplicated_items.append(item)
+                
+                if duplicates_count > 0:
+                    print(f"De-duplicated: removed {duplicates_count} duplicate items")
+                
+                # Apply limit after de-duplication
+                woot_items = deduplicated_items[:limit]
+                fetched_count = len(all_fetched_items)
+                print(f"Proceeding with {len(woot_items)} items for eBay analysis (after de-duplication and limit)")
+                print()
+            else:
+                # Single category: existing behavior
+                print(f"Fetching Woot deals (category: {categories[0]}, limit: {limit})...")
+                woot_items = fetch_woot_deals(category=categories[0], limit=limit)
+                # Attach source_category to each item
+                if woot_items:
+                    for item in woot_items:
+                        item['source_category'] = categories[0]
+                
+                if not woot_items:
+                    print("ERROR: Could not fetch Woot deals from API!")
+                    return []
+                
+                fetched_count = len(woot_items)
+                print(f"Fetched {fetched_count} items from Woot")
+                print()
     
     # Initialize counters
     filtered_nonflippable_count = 0
     skipped_low_asp_count = 0
     skipped_keyword_count = 0
+    skipped_brand_count = 0
     analyzed_count = 0
     ebay_ok_count = 0
     ebay_no_sold_comps_count = 0
@@ -1803,8 +2078,8 @@ def process_woot_mode(category: str = 'Tools', limit: int = 10, resume: bool = F
     
     # Print stream header if in stream mode
     if stream:
-        print("  Title" + " " * 54 + "| Buy      | Profit    | ROI    | Status")
-        print("-" * 92)
+        print("  Title" + " " * 54 + "| Buy      | Net Profit | Net ROI | Comps | Status | Reason")
+        print("-" * 100)
     
     # Process each Woot item
     for idx, item in enumerate(woot_items, 1):
@@ -1815,6 +2090,7 @@ def process_woot_mode(category: str = 'Tools', limit: int = 10, resume: bool = F
             url = item['url']
             item_category = item.get('category')
             condition = item.get('condition')
+            source_category = item.get('source_category', 'Unknown')
         else:
             # Parse Woot item
             parsed_item = parse_woot_item(item)
@@ -1827,26 +2103,115 @@ def process_woot_mode(category: str = 'Tools', limit: int = 10, resume: bool = F
             url = parsed_item['url']
             item_category = parsed_item.get('category')
             condition = parsed_item.get('condition')
+            source_category = item.get('source_category', 'Unknown')  # Extract source_category from raw item
         
         # Filter out non-flippable items
         if is_non_flippable(title, condition, item_category):
             log_debug(f"Filtered out non-flippable: {title[:50]}")
             filtered_nonflippable_count += 1
+            # Find matching keyword for reason
+            title_lower = title.lower()
+            condition_lower = (condition or '').lower()
+            category_lower = (item_category or '').lower()
+            combined_text = f"{title_lower} {condition_lower} {category_lower}"
+            filter_term = None
+            for term in ['refurbished', 'refurb', 'open box', 'open-box', 'parts only', 'for parts', 'parts/repair', 'broken', 'damaged', 'not working', 'accessories only', 'accessory', 'bundle', 'lot of', 'multi pack', 'pack of', 'set of']:
+                if term in combined_text:
+                    filter_term = term
+                    break
+            skip_reason = f"SKIP_NONFLIPPABLE (keyword={filter_term or 'matched'})"
+            results.append({
+                'title': title,
+                'buy_price': sale_price,
+                'url': url,
+                'category': item_category,
+                'source_category': source_category,
+                'passed': False,
+                'status': 'skipped',
+                'reason': 'SKIP_NONFLIPPABLE',
+                'fail_reason': skip_reason,
+                'mode': mode,
+                'fee_settings': {
+                    'ebay_fee_pct': ebay_fee_pct,
+                    'payment_fee_pct': payment_fee_pct,
+                    'shipping_flat': shipping_flat
+                }
+            })
             continue
         
         # Filter out low ASP items (buy_price < $20)
         if sale_price < 20.00:
             log_debug(f"Skipped low ASP item (<$20): {title}")
             skipped_low_asp_count += 1
+            skip_reason = f"SKIP_LOW_ASP (${sale_price:.2f} < $20.00)"
+            results.append({
+                'title': title,
+                'buy_price': sale_price,
+                'url': url,
+                'category': item_category,
+                'source_category': source_category,
+                'passed': False,
+                'status': 'skipped',
+                'reason': 'SKIP_LOW_ASP',
+                'fail_reason': skip_reason,
+                'mode': mode,
+                'fee_settings': {
+                    'ebay_fee_pct': ebay_fee_pct,
+                    'payment_fee_pct': payment_fee_pct,
+                    'shipping_flat': shipping_flat
+                }
+            })
             continue
         
         # Filter out non-arbitrage categories (keyword denylist)
         title_lower = title.lower()
-        denylist_keywords = ['baby', 'kids', 'toddler', 'infant', 'socks', 'clothing', 'shirt', 'bodysuit', 'underwear']
-        if any(keyword in title_lower for keyword in denylist_keywords):
-            log_debug(f"Skipped non-arbitrage category: {title}")
+        if any(keyword in title_lower for keyword in DENYLIST_KEYWORDS):
+            log_debug(f"Skipped keyword denylist: {title}")
             skipped_keyword_count += 1
+            # Find matching keyword
+            matched_keyword = next((kw for kw in DENYLIST_KEYWORDS if kw in title_lower), 'matched')
+            skip_reason = f"SKIP_DENYLIST_KEYWORD (keyword={matched_keyword})"
+            results.append({
+                'title': title,
+                'buy_price': sale_price,
+                'url': url,
+                'category': item_category,
+                'source_category': source_category,
+                'passed': False,
+                'status': 'skipped',
+                'reason': 'SKIP_DENYLIST_KEYWORD',
+                'fail_reason': skip_reason,
+                'mode': mode,
+                'fee_settings': {
+                    'ebay_fee_pct': ebay_fee_pct,
+                    'payment_fee_pct': payment_fee_pct,
+                    'shipping_flat': shipping_flat
+                }
+            })
             continue
+        
+        # Apply brand filter if specified
+        if brand_list:
+            if not any(brand in title_lower for brand in brand_list):
+                log_debug(f"Skipped brand filter: {title}")
+                skipped_brand_count += 1
+                skip_reason = f"SKIP_BRAND_FILTER (brand list={','.join(brand_list)})"
+                results.append({
+                    'title': title,
+                    'buy_price': sale_price,
+                    'url': url,
+                    'category': item_category,
+                    'source_category': source_category,
+                    'passed': False,
+                    'status': 'skipped',
+                    'reason': 'SKIP_BRAND_FILTER',
+                    'fail_reason': skip_reason,
+                    'mode': mode,
+                    'ebay_fee_pct': ebay_fee_pct,
+                    'payment_fee_pct': payment_fee_pct,
+                    'shipping_flat': shipping_flat
+                })
+                continue
         
         # Build query confidence score
         confidence_info = build_query_confidence(title)
@@ -1862,11 +2227,13 @@ def process_woot_mode(category: str = 'Tools', limit: int = 10, resume: bool = F
         # Skip LOW confidence items only if buy_price < 30
         LOW_CONFIDENCE_PRICE_THRESHOLD = 30.0
         if query_confidence == "low" and sale_price < LOW_CONFIDENCE_PRICE_THRESHOLD:
+            skip_reason = f"SKIP_LOW_CONFIDENCE (confidence=low, price=${sale_price:.2f} < ${LOW_CONFIDENCE_PRICE_THRESHOLD:.2f})"
             results.append({
                 'title': title,
                 'buy_price': sale_price,
                 'url': url,
                 'category': item_category,
+                'source_category': source_category,
                 'confidence': query_confidence,
                 'confidence_reasons': confidence_reasons,
                 'ebay_sold_count': None,
@@ -1884,9 +2251,15 @@ def process_woot_mode(category: str = 'Tools', limit: int = 10, resume: bool = F
                 'profit': 0,
                 'roi': 0,
                 'passed': False,
-                'status': 'failed',
-                'reason': 'LOW_CONFIDENCE',
-                'fail_reason': 'Low confidence query + low price'
+                'status': 'skipped',
+                'reason': 'SKIP_LOW_CONFIDENCE',
+                'fail_reason': skip_reason,
+                'mode': mode,
+                'fee_settings': {
+                    'ebay_fee_pct': ebay_fee_pct,
+                    'payment_fee_pct': payment_fee_pct,
+                    'shipping_flat': shipping_flat
+                }
             })
             if stream:
                 print(f"✗ {title[:60]:<60} | ${sale_price:>7.2f} | SKIPPED (low confidence)")
@@ -1903,6 +2276,7 @@ def process_woot_mode(category: str = 'Tools', limit: int = 10, resume: bool = F
                     'buy_price': sale_price,
                     'url': url,
                     'category': item_category,
+                    'source_category': source_category,
                     'ebay_sold_count': None,
                     'ebay_avg_sold_price': None,
                     'ebay_median_sold_price': None,
@@ -1921,7 +2295,11 @@ def process_woot_mode(category: str = 'Tools', limit: int = 10, resume: bool = F
                     'passed': False,
                     'status': 'failed',
                     'reason': 'NEEDS_SIZE',
-                    'fail_reason': 'Filter product requires size specification'
+                    'fail_reason': 'Filter product requires size specification',
+                    'mode': mode,
+                    'ebay_fee_pct': ebay_fee_pct,
+                    'payment_fee_pct': payment_fee_pct,
+                    'shipping_flat': shipping_flat
                 })
                 if stream:
                     print(f"✗ {title[:60]:<60} | ${sale_price:>7.2f} | FAIL (needs size)")
@@ -1951,6 +2329,7 @@ def process_woot_mode(category: str = 'Tools', limit: int = 10, resume: bool = F
                 'buy_price': sale_price,
                 'url': url,
                 'category': item_category,
+                'source_category': source_category,
                 'ebay_sold_count': 0,
                 'ebay_avg_sold_price': 0,
                 'ebay_median_sold_price': 0,
@@ -1966,7 +2345,13 @@ def process_woot_mode(category: str = 'Tools', limit: int = 10, resume: bool = F
                 'passed': False,
                 'status': 'failed',
                 'reason': 'NO_SOLD_COMPS',
-                'fail_reason': 'No sold comps found (valid search)'
+                'fail_reason': 'No sold comps found (valid search)',
+                'mode': mode,
+                'fee_settings': {
+                    'ebay_fee_pct': ebay_fee_pct,
+                    'payment_fee_pct': payment_fee_pct,
+                    'shipping_flat': shipping_flat
+                }
             })
             if stream:
                 print(f"✗ {title[:60]:<60} | ${sale_price:>7.2f} | NO_SOLD_COMPS")
@@ -1980,6 +2365,7 @@ def process_woot_mode(category: str = 'Tools', limit: int = 10, resume: bool = F
                 'buy_price': sale_price,
                 'url': url,
                 'category': item_category,
+                'source_category': source_category,
                 'ebay_sold_count': None,
                 'ebay_avg_sold_price': None,
                 'ebay_median_sold_price': None,
@@ -1995,7 +2381,13 @@ def process_woot_mode(category: str = 'Tools', limit: int = 10, resume: bool = F
                 'passed': False,
                 'status': 'pending',
                 'reason': 'EBAY_THROTTLED',
-                'fail_reason': 'eBay throttled; try again in a few minutes'
+                'fail_reason': 'eBay throttled; try again in a few minutes',
+                'mode': mode,
+                'fee_settings': {
+                    'ebay_fee_pct': ebay_fee_pct,
+                    'payment_fee_pct': payment_fee_pct,
+                    'shipping_flat': shipping_flat
+                }
             })
             if stream:
                 print(f"✗ {title[:60]:<60} | ${sale_price:>7.2f} | THROTTLED (stopping)")
@@ -2010,6 +2402,7 @@ def process_woot_mode(category: str = 'Tools', limit: int = 10, resume: bool = F
                 'buy_price': sale_price,
                 'url': url,
                 'category': item_category,
+                'source_category': source_category,
                 'ebay_sold_count': None,
                 'ebay_avg_sold_price': None,
                 'ebay_median_sold_price': None,
@@ -2025,7 +2418,13 @@ def process_woot_mode(category: str = 'Tools', limit: int = 10, resume: bool = F
                 'passed': False,
                 'status': 'pending',
                 'reason': 'BUDGET_EXHAUSTED',
-                'fail_reason': 'eBay budget exhausted; run again later'
+                'fail_reason': 'eBay budget exhausted; run again later',
+                'mode': mode,
+                'fee_settings': {
+                    'ebay_fee_pct': ebay_fee_pct,
+                    'payment_fee_pct': payment_fee_pct,
+                    'shipping_flat': shipping_flat
+                }
             })
             if stream:
                 print(f"✗ {title[:60]:<60} | ${sale_price:>7.2f} | BUDGET_EXHAUSTED")
@@ -2039,6 +2438,7 @@ def process_woot_mode(category: str = 'Tools', limit: int = 10, resume: bool = F
                 'buy_price': sale_price,
                 'url': url,
                 'category': item_category,
+                'source_category': source_category,
                 'ebay_sold_count': 0,
                 'ebay_avg_sold_price': 0,
                 'ebay_median_sold_price': 0,
@@ -2054,7 +2454,8 @@ def process_woot_mode(category: str = 'Tools', limit: int = 10, resume: bool = F
                 'passed': False,
                 'status': 'failed',
                 'reason': 'API_FAIL',
-                'fail_reason': 'eBay API lookup failed'
+                'fail_reason': 'eBay API lookup failed',
+                'mode': mode
             })
             if stream:
                 print(f"✗ {title[:60]:<60} | ${sale_price:>7.2f} | API_FAIL")
@@ -2069,6 +2470,7 @@ def process_woot_mode(category: str = 'Tools', limit: int = 10, resume: bool = F
                 'buy_price': sale_price,
                 'url': url,
                 'category': item_category,
+                'source_category': source_category,
                 'ebay_sold_count': ebay_result.get('sold_count', 0),
                 'ebay_avg_sold_price': ebay_result.get('avg_price', 0.0),
                 'ebay_median_sold_price': ebay_result.get('median_price', 0.0),
@@ -2087,7 +2489,8 @@ def process_woot_mode(category: str = 'Tools', limit: int = 10, resume: bool = F
                 'passed': False,
                 'status': 'failed',
                 'reason': 'LOW_CONFIDENCE_COMPS',
-                'fail_reason': ebay_result.get('confidence_reason', 'Low confidence comps')
+                'fail_reason': ebay_result.get('confidence_reason', 'Low confidence comps'),
+                'mode': mode
             })
             if stream:
                 print(f"✗ {title[:60]:<60} | ${sale_price:>7.2f} | LOW_CONFIDENCE_COMPS")
@@ -2104,18 +2507,20 @@ def process_woot_mode(category: str = 'Tools', limit: int = 10, resume: bool = F
             print(f" → eBay: {trimmed_count} trimmed from {sold_count} @ ${expected_sale_price:.2f} expected")
         
         # Calculate metrics using expected_sale_price (median)
-        metrics = calculate_metrics(sale_price, expected_sale_price, trimmed_count)
+        metrics = calculate_metrics(sale_price, expected_sale_price, trimmed_count, min_profit=scan_min_net_profit, min_roi=scan_min_net_roi, min_sold_comps=scan_min_sold_comps, ebay_fee_pct=ebay_fee_pct, payment_fee_pct=payment_fee_pct, shipping_flat=shipping_flat)
         
         result = {
             'title': title,
             'buy_price': sale_price,
             'url': url,
             'category': item_category,
+            'source_category': source_category,
             'ebay_sold_count': sold_count,
             'ebay_avg_sold_price': ebay_result.get('avg_price', 0.0),
             'ebay_median_sold_price': ebay_result.get('median_price', 0.0),
             'ebay_trimmed_count': trimmed_count,
             'ebay_expected_sale_price': expected_sale_price,
+            'sold_count_used': trimmed_count,  # Number of sold comps actually used after trimming
             'ebay_min_price': ebay_result.get('min_price'),
             'ebay_max_price': ebay_result.get('max_price'),
             'ebay_p25_price': ebay_result.get('p25_price'),
@@ -2124,8 +2529,15 @@ def process_woot_mode(category: str = 'Tools', limit: int = 10, resume: bool = F
             'ebay_last_sold_date': ebay_result.get('last_sold_date'),
             'confidence_reason': ebay_result.get('confidence_reason'),
             **metrics,
-            'status': 'passed' if metrics['passed'] else 'failed',
-            'reason': None  # No specific reason for items that reached metrics calculation
+            'status': metrics.get('status', 'passed' if metrics['passed'] else 'failed'),  # metrics['status'] is 'passed' or 'failed'
+            'reason': metrics.get('fail_reason', None) if not metrics['passed'] else None,
+            'fail_reason': metrics.get('fail_reason', None),
+            'mode': mode,  # Include scan mode in metadata
+            'fee_settings': {
+                'ebay_fee_pct': ebay_fee_pct,
+                'payment_fee_pct': payment_fee_pct,
+                'shipping_flat': shipping_flat
+            }
         }
         results.append(result)
         
@@ -2138,10 +2550,17 @@ def process_woot_mode(category: str = 'Tools', limit: int = 10, resume: bool = F
         if stream:
             status_symbol = "✓" if metrics['passed'] else "✗"
             status_text = "PASS" if metrics['passed'] else "FAIL"
-            print(f"{status_symbol} {title[:60]:<60} | ${sale_price:>7.2f} | ${metrics['profit']:>7.2f} | {metrics['roi']:>6.1%} | {status_text}")
+            comps_used = trimmed_count
+            reason = metrics.get('fail_reason', '') or ''
+            reason_display = reason[:25] if reason else ''
+            print(f"{status_symbol} {title[:60]:<60} | ${sale_price:>7.2f} | ${metrics['net_profit']:>10.2f} | {metrics['net_roi']:>7.1%} | comps: {comps_used} | {status_text:<6} | {reason_display}")
         else:
             status = "PASS" if metrics['passed'] else "FAIL"
-            print(f" → {status}: Profit ${metrics['profit']:.2f}, ROI {metrics['roi']:.2%}")
+            reason = metrics.get('fail_reason', '') or ''
+            if reason:
+                print(f" → {status}: Net Profit ${metrics['net_profit']:.2f}, Net ROI {metrics['net_roi']:.2%} | {reason}")
+            else:
+                print(f" → {status}: Net Profit ${metrics['net_profit']:.2f}, Net ROI {metrics['net_roi']:.2%}")
     
     # Check if any items reached eBay analysis
     if analyzed_count == 0:
@@ -2156,6 +2575,8 @@ def process_woot_mode(category: str = 'Tools', limit: int = 10, resume: bool = F
         print(f"  Filtered (non-flippable): {filtered_nonflippable_count}")
         print(f"  Skipped (<$20): {skipped_low_asp_count}")
         print(f"  Skipped (keyword denylist): {skipped_keyword_count}")
+        if skipped_brand_count > 0:
+            print(f"  Skipped (brand filter): {skipped_brand_count}")
         print(f"  Analyzed: {analyzed_count}")
         return []
     
@@ -2170,8 +2591,8 @@ def process_woot_mode(category: str = 'Tools', limit: int = 10, resume: bool = F
         passed_results = [r for r in results if r['passed']]
         failed_results = [r for r in results if not r['passed']]
         
-        # Sort PASS by ROI descending
-        passed_results.sort(key=lambda x: x['roi'], reverse=True)
+        # Sort PASS by Net ROI descending
+        passed_results.sort(key=lambda x: x.get('net_roi', 0), reverse=True)
         
         # Print PASS items
         if passed_results:
@@ -2181,8 +2602,8 @@ def process_woot_mode(category: str = 'Tools', limit: int = 10, resume: bool = F
                 print(f"Title: {result['title']}")
                 print(f"  Buy Price (Woot): ${result['buy_price']:.2f}")
                 print(f"  Avg Sold Price: ${result['ebay_avg_sold_price']:.2f}")
-                print(f"  Profit: ${result['profit']:.2f}")
-                print(f"  ROI: {result['roi']:.2%}")
+                print(f"  Net Profit: ${result.get('net_profit', 0):.2f}")
+                print(f"  Net ROI: {result.get('net_roi', 0):.2%}")
                 print(f"  Sold Count: {result['ebay_sold_count']}")
                 print(f"  URL: {result['url']}")
                 print()
@@ -2204,6 +2625,8 @@ def process_woot_mode(category: str = 'Tools', limit: int = 10, resume: bool = F
     print(f"  Filtered (non-flippable): {filtered_nonflippable_count}")
     print(f"  Skipped (<$20): {skipped_low_asp_count}")
     print(f"  Skipped (keyword denylist): {skipped_keyword_count}")
+    if skipped_brand_count > 0:
+        print(f"  Skipped (brand filter): {skipped_brand_count}")
     print(f"  Analyzed: {analyzed_count}")
     print(f"  Cache Hit: {cache_hit_count}")
     print(f"  Cache Miss: {cache_miss_count}")
@@ -2218,9 +2641,16 @@ def process_woot_mode(category: str = 'Tools', limit: int = 10, resume: bool = F
     
     return results
 
-def process_woot_mode_with_save(category: str = 'Tools', limit: int = 10, resume: bool = False, stream: bool = False):
+def process_woot_mode_with_save(category: str = 'Tools', limit: int = 10, resume: bool = False, stream: bool = False, brands: Optional[str] = None, mode: str = 'conservative', ebay_fee_pct: float = EBAY_FEE_PCT, payment_fee_pct: float = PAYMENT_FEE_PCT, shipping_flat: float = SHIPPING_FLAT):
     """Wrapper that runs process_woot_mode and saves results to file."""
-    results = process_woot_mode(category=category, limit=limit, resume=resume, stream=stream)
+    results = process_woot_mode(category=category, limit=limit, resume=resume, stream=stream, brands=brands, mode=mode, ebay_fee_pct=ebay_fee_pct, payment_fee_pct=payment_fee_pct, shipping_flat=shipping_flat)
+    
+    # Add scan_mode and source_categories to all results before saving
+    categories_list = [c.strip() for c in category.split(',') if c.strip()]
+    for result in results:
+        result['scan_mode'] = mode
+        result['source_categories'] = categories_list if len(categories_list) > 1 else categories_list[0] if categories_list else category
+    
     save_deals_to_file(results)
 
 def process_watchlist_mode():
@@ -2410,7 +2840,7 @@ def process_watchlist_mode():
             results.append(result)
             
             status = "PASS" if metrics['passed'] else "FAIL"
-            print(f"  → {status}: Profit ${metrics['profit']:.2f}, ROI {metrics['roi']:.2%}")
+            print(f"  → {status}: Net Profit ${metrics['net_profit']:.2f}, Net ROI {metrics['net_roi']:.2%}")
             if metrics['fail_reason']:
                 print(f"    Reason: {metrics['fail_reason']}")
         else:
@@ -2436,8 +2866,8 @@ def process_watchlist_mode():
     passed_results = [r for r in results if r['passed']]
     failed_results = [r for r in results if not r['passed']]
     
-    passed_results.sort(key=lambda x: x['roi'], reverse=True)
-    failed_results.sort(key=lambda x: x['roi'], reverse=True)
+    passed_results.sort(key=lambda x: x.get('net_roi', 0), reverse=True)
+    failed_results.sort(key=lambda x: x.get('net_roi', 0), reverse=True)
     
     sorted_results = passed_results + failed_results
     
@@ -2454,7 +2884,7 @@ def process_watchlist_mode():
             print(f"Title: {result['title'][:70]}")
             print(f"  Buy: ${result['buy_price']:.2f} @ {result['store']} | URL: {result['url']}")
             print(f"  eBay: {result['ebay_sold_count']} sold @ ${result['ebay_avg_sold_price']:.2f} avg")
-            print(f"  Net Sale: ${result['net_sale']:.2f} | Profit: ${result['profit']:.2f} | ROI: {result['roi']:.2%}")
+            print(f"  Net Profit: ${result.get('net_profit', 0):.2f} | Net ROI: {result.get('net_roi', 0):.2%}")
             print()
     
     if failed_results:
@@ -2465,7 +2895,7 @@ def process_watchlist_mode():
             print(f"  Buy: ${result['buy_price']:.2f} @ {result['store']} | URL: {result['url']}")
             if result['ebay_sold_count'] > 0:
                 print(f"  eBay: {result['ebay_sold_count']} sold @ ${result['ebay_avg_sold_price']:.2f} avg")
-                print(f"  Net Sale: ${result['net_sale']:.2f} | Profit: ${result['profit']:.2f} | ROI: {result['roi']:.2%}")
+                print(f"  Net Profit: ${result.get('net_profit', 0):.2f} | Net ROI: {result.get('net_roi', 0):.2%}")
             print(f"  Reason: {result['fail_reason']}")
             print()
 
@@ -2550,13 +2980,141 @@ def load_deals_from_file(input_file: str = 'data/deals.json') -> List[Dict]:
         print(f"ERROR reading {input_file}: {e}")
         return []
 
-def view_deals(top: int = 20, only_status: Optional[str] = None, show_failed: bool = False, show_throttled: bool = False, raw: bool = False):
-    """View saved deals from JSON file. Shows PASSED, FAILED, and PENDING sections."""
-    print("=" * 80)
-    print("View Saved Deals")
-    print("=" * 80)
-    print()
+def _export_deals_to_csv(deals: List[Dict], csv_path: str) -> int:
+    """Export deals to CSV file. Returns number of rows written (including header)."""
+    import csv
     
+    # Create output directory if needed
+    output_dir = os.path.dirname(csv_path)
+    if output_dir and not os.path.exists(output_dir):
+        os.makedirs(output_dir, exist_ok=True)
+    
+    # CSV headers
+    fieldnames = [
+        'title', 'woot_price', 'expected_sale', 'net_profit', 'net_roi', 'comps', 
+        'status', 'reason', 'woot_url', 'category', 'mode',
+        'ebay_fee_pct', 'payment_fee_pct', 'shipping_flat'
+    ]
+    
+    rows_written = 0
+    with open(csv_path, 'w', newline='', encoding='utf-8') as csvfile:
+        writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
+        writer.writeheader()
+        rows_written += 1
+        
+        for deal in deals:
+            # Extract fee settings
+            fee_settings = _extract_fee_settings(deal)
+            
+            # Get expected sale price
+            expected_sale = deal.get('ebay_expected_sale_price')
+            if expected_sale is None or expected_sale <= 0:
+                expected_sale = deal.get('ebay_avg_sold_price')
+            
+            # Get comps count
+            comps = deal.get('sold_count_used') or deal.get('ebay_trimmed_count')
+            
+            # Get scan mode
+            scan_mode = deal.get('scan_mode') or deal.get('mode', '')
+            
+            # Get reason/fail_reason
+            reason = deal.get('fail_reason') or deal.get('reason', '')
+            
+            row = {
+                'title': deal.get('title', ''),
+                'woot_price': deal.get('buy_price', ''),
+                'expected_sale': expected_sale if expected_sale is not None else '',
+                'net_profit': deal.get('net_profit', ''),
+                'net_roi': deal.get('net_roi', ''),
+                'comps': comps if comps is not None else '',
+                'status': deal.get('status', ''),
+                'reason': reason,
+                'woot_url': deal.get('url', ''),
+                'category': deal.get('source_category', ''),
+                'mode': scan_mode,
+                'ebay_fee_pct': fee_settings.get('ebay_fee_pct', '') if fee_settings else '',
+                'payment_fee_pct': fee_settings.get('payment_fee_pct', '') if fee_settings else '',
+                'shipping_flat': fee_settings.get('shipping_flat', '') if fee_settings else ''
+            }
+            writer.writerow(row)
+            rows_written += 1
+    
+    return rows_written
+
+def _extract_fee_settings(deal: Dict) -> Optional[Dict]:
+    """Extract fee_settings from a deal. Returns dict with ebay_fee_pct, payment_fee_pct, shipping_flat or None."""
+    # Prefer nested fee_settings object
+    fee_settings = deal.get('fee_settings')
+    if fee_settings and isinstance(fee_settings, dict):
+        return fee_settings
+    # Fallback to flat fields for backward compatibility
+    ebay_fee_pct = deal.get('ebay_fee_pct')
+    payment_fee_pct = deal.get('payment_fee_pct')
+    shipping_flat = deal.get('shipping_flat')
+    if ebay_fee_pct is not None and payment_fee_pct is not None and shipping_flat is not None:
+        return {
+            'ebay_fee_pct': ebay_fee_pct,
+            'payment_fee_pct': payment_fee_pct,
+            'shipping_flat': shipping_flat
+        }
+    return None
+
+def _get_mode_thresholds(mode: str) -> Tuple[float, float, int]:
+    """
+    Get mode thresholds (min_net_profit, min_net_roi, min_sold_comps) for a given mode.
+    Matches the logic used in process_woot_mode.
+    """
+    if mode == 'active':
+        return (10.0, 0.20, 8)
+    elif mode == 'highticket':
+        return (15.0, 0.10, 8)
+    else:  # conservative (default)
+        return (MIN_PROFIT, MIN_ROI, 12)
+
+def _is_near_miss(deal: Dict, near_profit: float, near_roi: float, near_comps: int) -> bool:
+    """
+    Check if a failed deal is a near-miss based on thresholds.
+    Returns True if deal failed but is within near-miss thresholds.
+    Checks reason field for failure type AND validates numeric closeness.
+    """
+    # Only check failed deals
+    status = deal.get('status')
+    if status != 'failed':
+        return False
+    
+    # Get reason field
+    fail_reason = deal.get('fail_reason') or deal.get('reason', '')
+    
+    # Get numeric values
+    net_profit = deal.get('net_profit')
+    net_roi = deal.get('net_roi')
+    # Handle various field name variations for comps
+    comps = deal.get('sold_count_used') or deal.get('ebay_trimmed_count') or deal.get('comps') or deal.get('sold_comps')
+    
+    # Get mode thresholds from the deal's scan_mode
+    scan_mode = deal.get('scan_mode') or deal.get('mode', 'conservative')
+    min_net_profit, min_net_roi, min_comps = _get_mode_thresholds(scan_mode)
+    
+    # Check if ANY of these are true:
+    # A) reason contains "FAIL_MIN_NET_PROFIT" AND (min_profit - net_profit) <= near_profit
+    if 'FAIL_MIN_NET_PROFIT' in fail_reason and net_profit is not None and net_profit < min_net_profit:
+        if (min_net_profit - net_profit) <= near_profit:
+            return True
+    
+    # B) reason contains "FAIL_MIN_NET_ROI" AND (min_roi - net_roi) <= near_roi
+    if 'FAIL_MIN_NET_ROI' in fail_reason and net_roi is not None and net_roi < min_net_roi:
+        if (min_net_roi - net_roi) <= near_roi:
+            return True
+    
+    # C) reason contains "FAIL_MIN_COMPS" AND (min_comps - comps) <= near_comps
+    if 'FAIL_MIN_COMPS' in fail_reason and comps is not None and comps < min_comps:
+        if (min_comps - comps) <= near_comps:
+            return True
+    
+    return False
+
+def view_deals(top: int = 20, only_status: Optional[str] = None, show_failed: bool = False, show_throttled: bool = False, raw: bool = False, show_all: bool = False, mode_filter: Optional[str] = None, category_filter: Optional[str] = None, ebay_fee_pct: float = EBAY_FEE_PCT, payment_fee_pct: float = PAYMENT_FEE_PCT, shipping_flat: float = SHIPPING_FLAT, export_csv: Optional[str] = None, near_miss: bool = False, near_profit: float = 5.0, near_roi: float = 0.02, near_comps: int = 2):
+    """View saved deals from JSON file. Shows PASSED, FAILED, and PENDING sections."""
     deals = load_deals_from_file()
     if not deals:
         if os.path.exists('data/deals.json'):
@@ -2564,75 +3122,205 @@ def view_deals(top: int = 20, only_status: Optional[str] = None, show_failed: bo
         sys.exit(1)
         return
     
-    # Handle --raw mode: bypass all filters and show first 10 deals
-    if raw:
-        print(f"[RAW MODE] Showing first 10 deals (no filters):")
-        print("-" * 80)
-        for i, deal in enumerate(deals[:10], 1):
-            print(f"{i}. {deal.get('title', 'N/A')[:70]}")
-            print(f"   Buy: ${deal.get('buy_price', 0):.2f} | Profit: ${deal.get('profit', 0):.2f} | ROI: {deal.get('roi', 0):.2%}")
-            print(f"   Status: {deal.get('status', 'unknown')} | URL: {deal.get('url', 'N/A')}")
-            print()
-        return
+    # Determine effective fee settings from deals
+    effective_fee_settings = None
     
-    # Separate deals into PASSED, FAILED, PENDING
+    # Separate deals into PASSED, FAILED, PENDING, SKIPPED
     passed_deals = []
     failed_deals = []
     pending_deals = []
+    skipped_deals = []
     
     for deal in deals:
         status = deal.get('status')
         if status == 'pending':
             pending_deals.append(deal)
+        elif status == 'skipped':
+            skipped_deals.append(deal)
         elif status == 'passed' or (status is None and deal.get('passed', False)):
             passed_deals.append(deal)
         else:
             failed_deals.append(deal)
     
-    # Sort each section by ROI descending
-    passed_deals.sort(key=lambda x: x.get('roi', 0), reverse=True)
-    failed_deals.sort(key=lambda x: x.get('roi', 0), reverse=True)
+    # Filter PASSED deals by mode and category if specified
+    if mode_filter:
+        passed_deals = [d for d in passed_deals if d.get('scan_mode') == mode_filter or d.get('mode') == mode_filter]
+    if category_filter:
+        category_filter_lower = category_filter.lower()
+        filtered_passed = []
+        for d in passed_deals:
+            source_categories = d.get('source_categories', [])
+            if isinstance(source_categories, str):
+                source_categories = [source_categories]
+            elif not isinstance(source_categories, list):
+                source_categories = []
+            # Check if category_filter matches any category in source_categories (case-insensitive)
+            if any(cat.lower() == category_filter_lower for cat in source_categories if cat):
+                filtered_passed.append(d)
+        passed_deals = filtered_passed
+    
+    # Try to get fee settings from the deals that will be displayed (prioritize passed_deals)
+    if passed_deals:
+        effective_fee_settings = _extract_fee_settings(passed_deals[0])
+    elif deals:  # If no passed deals, try any deal with fee_settings
+        for deal in deals:
+            fee_settings = _extract_fee_settings(deal)
+            if fee_settings:
+                effective_fee_settings = fee_settings
+                break
+    
+    # Fall back to CLI args / defaults
+    if effective_fee_settings is None:
+        effective_fee_settings = {
+            'ebay_fee_pct': ebay_fee_pct,
+            'payment_fee_pct': payment_fee_pct,
+            'shipping_flat': shipping_flat
+        }
+    
+    # Print header with effective fee settings
+    print("=" * 80)
+    print("View Saved Deals")
+    print(f"Fee settings: ebay_fee_pct={effective_fee_settings['ebay_fee_pct']:.4f}, payment_fee_pct={effective_fee_settings['payment_fee_pct']:.4f}, shipping_flat=${effective_fee_settings['shipping_flat']:.2f}")
+    print("=" * 80)
+    print()
+    
+    # Handle --raw mode: bypass all filters and show first 10 deals
+    if raw:
+        print(f"[RAW MODE] Showing first 10 deals (no filters):")
+        print("-" * 80)
+        raw_deals = deals[:10]
+        for i, deal in enumerate(raw_deals, 1):
+            print(f"{i}. {deal.get('title', 'N/A')[:70]}")
+            print(f"   Buy: ${deal.get('buy_price', 0):.2f} | Net Profit: ${deal.get('net_profit', 0):.2f} | Net ROI: {deal.get('net_roi', 0):.2%}")
+            print(f"   Status: {deal.get('status', 'unknown')} | URL: {deal.get('url', 'N/A')}")
+            print()
+        
+        # Export if requested
+        if export_csv:
+            rows_written = _export_deals_to_csv(raw_deals, export_csv)
+            print(f"Exported {rows_written - 1} rows to {export_csv}")  # Subtract 1 for header
+            print()
+        return
+    
+    # Sort PASSED deals by net_profit descending, then net_roi if net_profit equal
+    passed_deals.sort(key=lambda x: (x.get('net_profit', 0), x.get('net_roi', 0)), reverse=True)
+    failed_deals.sort(key=lambda x: x.get('net_roi', 0), reverse=True)
     pending_deals.sort(key=lambda x: x.get('buy_price', 0), reverse=True)
     
-    # Limit to top N for each section
+    # Store original counts before limiting
+    total_passed = len(passed_deals)
+    
+    # Limit to top N for PASSED section
     if top > 0:
         passed_deals = passed_deals[:top]
-        failed_deals = failed_deals[:top]
-        pending_deals = pending_deals[:top]
     
     # Filter sections based on flags
     if only_status:
         if only_status.lower() == 'passed':
             failed_deals = []
             pending_deals = []
+            show_all = False  # Override --all when only_status=passed
         elif only_status.lower() == 'failed':
             passed_deals = []
             pending_deals = []
+            show_all = False
         elif only_status.lower() == 'pending':
             passed_deals = []
             failed_deals = []
+            show_all = False
         else:
             print(f"ERROR: Invalid status '{only_status}'. Use 'passed', 'failed', or 'pending'.")
             return
     
-    # Print PASSED section
+    # Default behavior: show only PASSED deals (unless --all is specified)
+    if not show_all and not only_status:
+        failed_deals = []
+        pending_deals = []
+    
+    # Limit FAILED section only if showing all
+    if show_all and top > 0:
+        failed_deals = failed_deals[:top]
+    
+    # Print PASSED section (always show if available)
     if passed_deals:
         print(f"✓ PASSED ({len(passed_deals)} items):")
         print("-" * 80)
         for deal in passed_deals:
+            title = deal.get('title', 'N/A')
+            buy_price = deal.get('buy_price', 0)
+            # Use expected_sale_price if available, otherwise use avg_sold_price as proxy
+            expected_sale = deal.get('ebay_expected_sale_price')
+            if expected_sale is None or expected_sale <= 0:
+                expected_sale = deal.get('ebay_avg_sold_price', 0)
+            url = deal.get('url', 'N/A')
+            
+            # Get scan_mode and source_category for display
+            scan_mode = deal.get('scan_mode') or deal.get('mode', 'N/A')
+            source_category = deal.get('source_category', 'Unknown')
+            
+            # Get net profit metrics
+            net_profit = deal.get('net_profit', 0)
+            net_roi = deal.get('net_roi', 0)
+            comps_used = deal.get('sold_count_used') or deal.get('ebay_trimmed_count', 0)
+            print(f"Title: {title[:70]}")
+            print(f"  Buy: ${buy_price:.2f} | Expected Sale: ${expected_sale:.2f} | Net Profit: ${net_profit:.2f} | Net ROI: {net_roi:.2%} | Comps: {comps_used}")
+            print(f"  Mode: {scan_mode} | Category: {source_category}")
+            print(f"  URL: {url}")
+            print()
+    # Filter near-miss deals if --near-miss is ON and --all is NOT
+    near_miss_deals = []
+    if near_miss and not show_all:
+        near_miss_deals = [d for d in failed_deals if _is_near_miss(d, near_profit, near_roi, near_comps)]
+        # Sort near-miss results by net_profit desc then net_roi desc
+        near_miss_deals.sort(key=lambda x: (x.get('net_profit', 0), x.get('net_roi', 0)), reverse=True)
+    
+    # Check if we should return early (only if no PASS deals AND no near-miss deals AND no export requested)
+    if not passed_deals and not near_miss_deals and not show_all and not only_status:
+        # No PASS deals and no near-miss deals and not showing all - show helpful message
+        print("No PASS deals found. Try --all or run scan with --mode active.")
+        if near_miss:
+            print("Note: Use --near-miss to see items that failed but are close to passing.")
+        print()
+        # Don't return early if CSV export is requested - export will happen below
+        if not export_csv:
+            return
+    
+    # Print NEAR-MISS section (only if --near-miss is ON and --all is NOT)
+    if near_miss_deals:
+        print(f"≈ NEAR-MISS ({len(near_miss_deals)} items):")
+        print("-" * 80)
+        for deal in near_miss_deals:
             print(f"Title: {deal.get('title', 'N/A')[:70]}")
             print(f"  Buy: ${deal.get('buy_price', 0):.2f} | URL: {deal.get('url', 'N/A')}")
-            ebay_count = deal.get('ebay_sold_count')
-            if ebay_count is not None and ebay_count > 0:
-                print(f"  eBay: {ebay_count} sold @ ${deal.get('ebay_avg_sold_price', 0):.2f} avg")
-                print(f"  Net Sale: ${deal.get('net_sale', 0):.2f} | Profit: ${deal.get('profit', 0):.2f} | ROI: {deal.get('roi', 0):.2%}")
+            fail_reason = deal.get('fail_reason') or deal.get('reason', 'Unknown')
+            print(f"  Reason: {fail_reason}")
+            if deal.get('net_profit') is not None:
+                net_profit = deal.get('net_profit', 0)
+                net_roi = deal.get('net_roi', 0)
+                comps_used = deal.get('sold_count_used') or deal.get('ebay_trimmed_count') or deal.get('comps') or deal.get('sold_comps') or 0
+                print(f"  Net Profit: ${net_profit:.2f} | Net ROI: {net_roi:.2%} | Comps: {comps_used}")
             print()
     
-    # Print FAILED section (only if explicitly requested)
-    if failed_deals and (show_failed or (only_status and only_status.lower() == 'failed')):
+    # Print FAILED section (only if --all is specified or explicitly requested)
+    if failed_deals and (show_all or show_failed or (only_status and only_status.lower() == 'failed')):
         print(f"✗ FAILED ({len(failed_deals)} items):")
         print("-" * 80)
         for deal in failed_deals:
+            print(f"Title: {deal.get('title', 'N/A')[:70]}")
+            print(f"  Buy: ${deal.get('buy_price', 0):.2f} | URL: {deal.get('url', 'N/A')}")
+            fail_reason = deal.get('fail_reason') or deal.get('reason', 'Unknown')
+            print(f"  Reason: {fail_reason}")
+            if deal.get('net_profit') is not None:
+                net_profit = deal.get('net_profit', 0)
+                net_roi = deal.get('net_roi', 0)
+                print(f"  Net Profit: ${net_profit:.2f} | Net ROI: {net_roi:.2%}")
+            print()
+    
+    # Print SKIPPED section (only if --all is specified)
+    if skipped_deals and show_all:
+        print(f"⊘ SKIPPED ({len(skipped_deals)} items):")
+        print("-" * 80)
+        for deal in skipped_deals:
             print(f"Title: {deal.get('title', 'N/A')[:70]}")
             print(f"  Buy: ${deal.get('buy_price', 0):.2f} | URL: {deal.get('url', 'N/A')}")
             fail_reason = deal.get('fail_reason') or deal.get('reason', 'Unknown')
@@ -2660,6 +3348,8 @@ def view_deals(top: int = 20, only_status: Optional[str] = None, show_failed: bo
             filters.append(f"top={top}")
         if only_status:
             filters.append(f"only_status={only_status}")
+        if near_miss:
+            filters.append(f"near_miss=True (profit<={near_profit}, roi<={near_roi}, comps<={near_comps})")
         if not show_failed:
             filters.append("show_failed=False (default)")
         if not show_throttled:
@@ -2674,6 +3364,27 @@ def view_deals(top: int = 20, only_status: Optional[str] = None, show_failed: bo
         print(f"Total in file: PASSED={total_passed}, FAILED={total_failed}, PENDING={total_pending}")
         print()
         print("Tip: Use --show-failed or --show-throttled to see more, or --raw to bypass filters")
+        print()
+    
+    # Export to CSV if requested (raw mode handles export before return above)
+    if export_csv:
+        # Collect all deals that are being displayed (same logic as print sections above)
+        deals_to_export = []
+        if passed_deals:
+            deals_to_export.extend(passed_deals)
+        # Include near-miss deals if --near-miss is ON and --all is NOT
+        if near_miss_deals:
+            deals_to_export.extend(near_miss_deals)
+        if failed_deals and (show_all or show_failed or (only_status and only_status.lower() == 'failed')):
+            deals_to_export.extend(failed_deals)
+        if skipped_deals and show_all:
+            deals_to_export.extend(skipped_deals)
+        if pending_deals and (show_throttled or (only_status and only_status.lower() == 'pending')):
+            deals_to_export.extend(pending_deals)
+        
+        # Always write CSV (even with 0 rows) when --export-csv is provided
+        rows_written = _export_deals_to_csv(deals_to_export, export_csv)
+        print(f"Exported {rows_written - 1} rows to {export_csv}")  # Subtract 1 for header
         print()
 
 def main():
@@ -2693,7 +3404,7 @@ def main():
     parser.add_argument('mode', nargs='?', default=None, choices=['woot', 'watchlist'],
                        help='[DEPRECATED] Use "scan" or "view" subcommands instead')
     parser.add_argument('--category', default='Tools',
-                       help='Woot feed category (default: Tools) - for backward compatibility')
+                       help='Woot feed category (default: Tools). Can be a single category or comma-separated list - for backward compatibility')
     parser.add_argument('--limit', type=int, default=10,
                        help='Maximum number of items to scan (default: 10) - for backward compatibility')
     
@@ -2703,13 +3414,23 @@ def main():
     # scan subcommand
     scan_parser = subparsers.add_parser('scan', help='Scan Woot deals and analyze eBay sold listings')
     scan_parser.add_argument('--category', default='Tools',
-                            help='Woot feed category (default: Tools)')
+                            help='Woot feed category (default: Tools). Can be a single category or comma-separated list, e.g. "Tools,Electronics"')
     scan_parser.add_argument('--limit', type=int, default=10,
                             help='Maximum number of items to scan (default: 10)')
     scan_parser.add_argument('--resume', action='store_true',
                             help='Resume scan: only process pending items from deals.json')
     scan_parser.add_argument('--stream', action='store_true',
                             help='Stream results live as they are evaluated (prints each deal immediately)')
+    scan_parser.add_argument('--brands', type=str,
+                            help='Comma-separated list of brands to filter (case-insensitive), e.g. --brands milwaukee,dewalt,makita')
+    scan_parser.add_argument('--mode', type=str, choices=['conservative', 'active', 'highticket'], default='conservative',
+                            help='Scan mode: conservative (default, min profit $20, ROI 25%%), active (min profit $10, ROI 20%%), or highticket (min profit $15, ROI 10%%)')
+    scan_parser.add_argument('--ebay-fee-pct', type=float, default=EBAY_FEE_PCT,
+                            help=f'eBay fee percentage (default: {EBAY_FEE_PCT})')
+    scan_parser.add_argument('--payment-fee-pct', type=float, default=PAYMENT_FEE_PCT,
+                            help=f'Payment processing fee percentage (default: {PAYMENT_FEE_PCT})')
+    scan_parser.add_argument('--shipping-flat', type=float, default=SHIPPING_FLAT,
+                            help=f'Flat shipping cost (default: ${SHIPPING_FLAT})')
     
     # view subcommand
     view_parser = subparsers.add_parser('view', help='View saved scan results')
@@ -2723,6 +3444,28 @@ def main():
                             help='Include throttled items')
     view_parser.add_argument('--raw', action='store_true',
                             help='Bypass filters and show first 10 deals (title, profit, ROI)')
+    view_parser.add_argument('--all', action='store_true',
+                            help='Show both PASSED and FAILED deals (default: show only PASSED)')
+    view_parser.add_argument('--mode', type=str, choices=['conservative', 'active', 'highticket'],
+                            help='Filter PASSED deals by scan mode (conservative, active, or highticket)')
+    view_parser.add_argument('--category', type=str,
+                            help='Filter PASSED deals by category membership (e.g., Tools or Electronics)')
+    view_parser.add_argument('--ebay-fee-pct', type=float, default=EBAY_FEE_PCT,
+                            help=f'eBay fee percentage (default: {EBAY_FEE_PCT}, only used if deal record lacks fee settings)')
+    view_parser.add_argument('--payment-fee-pct', type=float, default=PAYMENT_FEE_PCT,
+                            help=f'Payment processing fee percentage (default: {PAYMENT_FEE_PCT}, only used if deal record lacks fee settings)')
+    view_parser.add_argument('--shipping-flat', type=float, default=SHIPPING_FLAT,
+                            help=f'Flat shipping cost (default: ${SHIPPING_FLAT}, only used if deal record lacks fee settings)')
+    view_parser.add_argument('--export-csv', type=str, metavar='PATH',
+                            help='Export displayed results to CSV file (e.g., data/results.csv)')
+    view_parser.add_argument('--near-miss', action='store_true',
+                            help='Show near-miss items (failed but close to thresholds)')
+    view_parser.add_argument('--near-profit', type=float, default=5.0,
+                            help='Near-miss threshold for profit in dollars (default: 5.0)')
+    view_parser.add_argument('--near-roi', type=float, default=0.02,
+                            help='Near-miss threshold for ROI as decimal (default: 0.02 = 2%%)')
+    view_parser.add_argument('--near-comps', type=int, default=2,
+                            help='Near-miss threshold for comps count (default: 2)')
     
     args = parser.parse_args()
     
@@ -2813,24 +3556,46 @@ def main():
         # New scan command
         resume_flag = getattr(args, 'resume', False)
         stream_flag = getattr(args, 'stream', False)
-        process_woot_mode_with_save(category=args.category, limit=args.limit, resume=resume_flag, stream=stream_flag)
+        brands_str = getattr(args, 'brands', None)
+        # args.mode refers to --mode option in scan subcommand
+        mode_str = getattr(args, 'mode', 'conservative')
+        ebay_fee_pct = getattr(args, 'ebay_fee_pct', EBAY_FEE_PCT)
+        payment_fee_pct = getattr(args, 'payment_fee_pct', PAYMENT_FEE_PCT)
+        shipping_flat = getattr(args, 'shipping_flat', SHIPPING_FLAT)
+        process_woot_mode_with_save(category=args.category, limit=args.limit, resume=resume_flag, stream=stream_flag, brands=brands_str, mode=mode_str, ebay_fee_pct=ebay_fee_pct, payment_fee_pct=payment_fee_pct, shipping_flat=shipping_flat)
     elif args.command == 'view':
         # New view command
+        ebay_fee_pct = getattr(args, 'ebay_fee_pct', EBAY_FEE_PCT)
+        payment_fee_pct = getattr(args, 'payment_fee_pct', PAYMENT_FEE_PCT)
+        shipping_flat = getattr(args, 'shipping_flat', SHIPPING_FLAT)
         view_deals(top=args.top, only_status=args.only_status, 
                    show_failed=args.show_failed, show_throttled=args.show_throttled,
-                   raw=getattr(args, 'raw', False))
-    elif args.mode == 'woot':
-        # Backward compatibility: map "woot" to scan
+                   raw=getattr(args, 'raw', False), show_all=getattr(args, 'all', False),
+                   mode_filter=getattr(args, 'mode', None), category_filter=getattr(args, 'category', None),
+                   ebay_fee_pct=ebay_fee_pct, payment_fee_pct=payment_fee_pct, shipping_flat=shipping_flat,
+                   export_csv=getattr(args, 'export_csv', None),
+                   near_miss=getattr(args, 'near_miss', False),
+                   near_profit=getattr(args, 'near_profit', 5.0),
+                   near_roi=getattr(args, 'near_roi', 0.02),
+                   near_comps=getattr(args, 'near_comps', 2))
+    elif hasattr(args, 'mode') and args.mode == 'woot':
+        # Backward compatibility: map "woot" to scan (positional mode, not --mode option)
         resume_flag = getattr(args, 'resume', False)
         stream_flag = getattr(args, 'stream', False)  # Backward compat doesn't have --stream, defaults to False
-        process_woot_mode_with_save(category=args.category, limit=args.limit, resume=resume_flag, stream=stream_flag)
+        brands_str = getattr(args, 'brands', None)
+        # For backward compat positional mode, default to conservative mode (--mode option not available)
+        mode_str = 'conservative'
+        process_woot_mode_with_save(category=args.category, limit=args.limit, resume=resume_flag, stream=stream_flag, brands=brands_str, mode=mode_str)
     elif args.mode == 'watchlist':
         # Backward compatibility: watchlist mode
         process_watchlist_mode()
-    elif args.command is None and args.mode is None:
+    elif args.command is None and (not hasattr(args, 'mode') or args.mode is None):
         # No command specified - default to scan (backward compatibility)
         resume_flag = getattr(args, 'resume', False)
-        process_woot_mode_with_save(category=args.category, limit=args.limit, resume=resume_flag)
+        brands_str = getattr(args, 'brands', None)
+        # For backward compat, default to conservative mode
+        mode_str = 'conservative'
+        process_woot_mode_with_save(category=args.category, limit=args.limit, resume=resume_flag, brands=brands_str, mode=mode_str)
     else:
         # Default: show help
         parser.print_help()
