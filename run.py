@@ -18,6 +18,7 @@ import sys
 import argparse
 import random
 import time
+import csv
 from urllib.parse import urlparse, quote, urlencode
 from typing import Optional, Tuple, List, Dict, Any
 from statistics import mean, median
@@ -2658,6 +2659,437 @@ def process_woot_mode(category: str = 'Tools', limit: int = 10, resume: bool = F
     
     return results
 
+def process_upload_csv_mode(infile: str, mode: str = 'highticket', ebay_fee_pct: float = EBAY_FEE_PCT, payment_fee_pct: float = PAYMENT_FEE_PCT, shipping_flat: float = SHIPPING_FLAT, run_id: Optional[str] = None, no_cache: bool = False) -> List[Dict]:
+    """
+    Process uploaded CSV file through eBay analysis pipeline.
+    Returns list of result dictionaries (same format as process_woot_mode).
+    """
+    # Read and normalize CSV
+    items = []
+    try:
+        with open(infile, 'r', encoding='utf-8') as f:
+            reader = csv.DictReader(f)
+            for row in reader:
+                # Normalize keys: strip whitespace, remove BOM, lowercase
+                def norm_key(k):
+                    return (k or "").strip().lstrip("\ufeff").lower()
+                
+                clean = {norm_key(k): (v.strip() if isinstance(v, str) else v) for k, v in row.items() if k is not None}
+                
+                # Extract title (required)
+                title = None
+                for title_key in ['title', 'name', 'item', 'product', 'item_name']:
+                    if title_key in clean and clean[title_key]:
+                        title = str(clean[title_key]).strip()
+                        break
+                
+                if not title:
+                    continue
+                
+                # Extract price (required)
+                price = None
+                price_field_exists = False
+                for price_key in ['price', 'cost', 'buy_price', 'sale_price', 'purchase_price', 'woot_price']:
+                    if price_key in clean:
+                        price_field_exists = True
+                        price_str = str(clean[price_key]).strip() if clean[price_key] else ""
+                        if price_str:
+                            try:
+                                price = float(price_str.replace('$', '').replace(',', '').strip())
+                                if price > 0:
+                                    break
+                            except (ValueError, TypeError):
+                                pass
+                
+                if not price_field_exists or price is None or price <= 0:
+                    continue
+                
+                # Extract optional fields
+                url = None
+                for url_key in ['url', 'link', 'source_url', 'woot_url', 'product_url']:
+                    if url_key in clean and clean[url_key]:
+                        url = str(clean[url_key]).strip()
+                        break
+                
+                category = None
+                for cat_key in ['category', 'categories', 'cat']:
+                    if cat_key in clean and clean[cat_key]:
+                        category = str(clean[cat_key]).strip()
+                        break
+                
+                store = None
+                for store_key in ['store', 'merchant', 'seller', 'retailer']:
+                    if store_key in clean and clean[store_key]:
+                        store = str(clean[store_key]).strip()
+                        break
+                
+                sku = None
+                if 'sku' in clean and clean['sku']:
+                    sku = str(clean['sku']).strip()
+                
+                image_url = None
+                for img_key in ['image_url', 'image', 'imageurl', 'img_url', 'picture_url']:
+                    if img_key in clean and clean[img_key]:
+                        image_url = str(clean[img_key]).strip()
+                        break
+                
+                items.append({
+                    'title': title,
+                    'buy_price': price,
+                    'sale_price': price,  # For compatibility with analysis pipeline
+                    'url': url,
+                    'category': category,
+                    'source_category': category or 'Upload',
+                    'store': store,
+                    'sku': sku,
+                    'image_url': image_url
+                })
+    except Exception as e:
+        print(f"ERROR reading CSV file: {e}")
+        return []
+    
+    # Process items through the same analysis pipeline as Woot items
+    # (Reuse the core analysis logic from process_woot_mode)
+    # Set mode thresholds
+    if mode == 'active':
+        scan_min_net_profit = 10.0
+        scan_min_net_roi = 0.20
+        scan_min_sold_comps = 8
+    elif mode == 'highticket':
+        scan_min_net_profit = 12.0
+        scan_min_net_roi = 0.10
+        scan_min_sold_comps = 6
+    else:  # conservative (default)
+        scan_min_net_profit = MIN_PROFIT
+        scan_min_net_roi = MIN_ROI
+        scan_min_sold_comps = 12
+    
+    print("=" * 80)
+    print("CSV Upload → eBay Sold Arbitrage Checker")
+    if no_cache:
+        print("[CACHE] bypassed (no-cache enabled)")
+    print(f"Mode: {mode} (min net profit ${scan_min_net_profit:.0f}, min net ROI {scan_min_net_roi:.0%}, min sold comps {scan_min_sold_comps})")
+    print(f"CSV file: {infile}")
+    print(f"Items loaded: {len(items)}")
+    print("=" * 80)
+    print()
+    
+    # Initialize counters
+    analyzed_count = 0
+    ebay_ok_count = 0
+    ebay_no_sold_comps_count = 0
+    ebay_throttled_count = 0
+    ebay_budget_exhausted_count = 0
+    ebay_api_fail_count = 0
+    failed_criteria_count = 0
+    passed_count = 0
+    
+    # Reset global cache counters
+    global _cache_hit_count, _cache_miss_count, EBAY_CALLS_MADE
+    _cache_hit_count = 0
+    _cache_miss_count = 0
+    EBAY_CALLS_MADE = 0
+    
+    results = []
+    analyzed_index = 0
+    accepted_rows = len(items)  # All items that passed title/price validation
+    
+    # Process each item (lenient: attempt eBay analysis for all accepted items)
+    for idx, item in enumerate(items, 1):
+        title = item['title']
+        sale_price = item['buy_price']
+        url = item.get('url')
+        item_category = item.get('category')
+        source_category = item.get('source_category', 'Upload')
+        
+        # For upload path: Always attempt eBay analysis (no pre-filtering)
+        # Use title directly as query (light cleanup)
+        analyzed_count += 1
+        analyzed_index += 1
+        print(f"[{analyzed_index}] {title[:60]}... | ${sale_price:.2f}", end='')
+        
+        # Search eBay (use cleaned title directly, no confidence gate)
+        search_query = clean_title_for_ebay(title)
+        ebay_result = search_ebay_sold(search_query, original_title=title, no_cache=no_cache)
+        
+        # Handle eBay results (same logic as process_woot_mode)
+        if ebay_result['status'] == 'SUCCESS':
+            ebay_ok_count += 1
+            sold_count = ebay_result['sold_count']
+            expected_sale_price = ebay_result.get('expected_sale_price', ebay_result.get('median_price', 0.0))
+            trimmed_count = ebay_result.get('trimmed_count', sold_count)
+            
+            print(f" → eBay: {trimmed_count} trimmed from {sold_count} @ ${expected_sale_price:.2f} expected")
+            
+            # Calculate metrics
+            metrics = calculate_metrics(sale_price, expected_sale_price, trimmed_count, min_profit=scan_min_net_profit, min_roi=scan_min_net_roi, min_sold_comps=scan_min_sold_comps, ebay_fee_pct=ebay_fee_pct, payment_fee_pct=payment_fee_pct, shipping_flat=shipping_flat)
+            
+            result = {
+                'title': title,
+                'buy_price': sale_price,
+                'url': url,
+                'category': item_category,
+                'source_category': source_category,
+                'ebay_sold_count': sold_count,
+                'ebay_avg_sold_price': ebay_result.get('avg_price', 0.0),
+                'ebay_median_sold_price': ebay_result.get('median_price', 0.0),
+                'ebay_trimmed_count': trimmed_count,
+                'ebay_expected_sale_price': expected_sale_price,
+                'sold_count_used': trimmed_count,
+                'ebay_min_price': ebay_result.get('min_price'),
+                'ebay_max_price': ebay_result.get('max_price'),
+                'ebay_p25_price': ebay_result.get('p25_price'),
+                'ebay_p75_price': ebay_result.get('p75_price'),
+                'ebay_sample_items': ebay_result.get('sample_items', []),
+                'ebay_last_sold_date': ebay_result.get('last_sold_date'),
+                'confidence_reason': ebay_result.get('confidence_reason'),
+                **metrics,
+                'status': metrics.get('status', 'passed' if metrics['passed'] else 'failed'),
+                'reason': metrics.get('fail_reason', None) if not metrics['passed'] else None,
+                'fail_reason': metrics.get('fail_reason', None),
+                'mode': mode,
+                'fee_settings': {
+                    'ebay_fee_pct': ebay_fee_pct,
+                    'payment_fee_pct': payment_fee_pct,
+                    'shipping_flat': shipping_flat
+                }
+            }
+            results.append(result)
+            
+            if metrics['passed']:
+                passed_count += 1
+            else:
+                failed_criteria_count += 1
+            
+            status = "PASS" if metrics['passed'] else "FAIL"
+            reason = metrics.get('fail_reason', '') or ''
+            if reason:
+                print(f" → {status}: Net Profit ${metrics['net_profit']:.2f}, Net ROI {metrics['net_roi']:.2%} | {reason}")
+            else:
+                print(f" → {status}: Net Profit ${metrics['net_profit']:.2f}, Net ROI {metrics['net_roi']:.2%}")
+        elif ebay_result['status'] == 'NO_SOLD_COMPS':
+            ebay_no_sold_comps_count += 1
+            results.append({
+                'title': title,
+                'buy_price': sale_price,
+                'url': url,
+                'category': item_category,
+                'source_category': source_category,
+                'ebay_sold_count': 0,
+                'ebay_avg_sold_price': 0,
+                'ebay_median_sold_price': 0,
+                'ebay_min_price': None,
+                'ebay_max_price': None,
+                'ebay_p25_price': None,
+                'ebay_p75_price': None,
+                'ebay_sample_items': [],
+                'ebay_last_sold_date': None,
+                'net_sale': 0,
+                'profit': 0,
+                'roi': 0,
+                'passed': False,
+                'status': 'failed',
+                'reason': 'NO_SOLD_COMPS',
+                'fail_reason': 'No sold comps found (valid search)',
+                'mode': mode,
+                'fee_settings': {
+                    'ebay_fee_pct': ebay_fee_pct,
+                    'payment_fee_pct': payment_fee_pct,
+                    'shipping_flat': shipping_flat
+                }
+            })
+            print(f" → No sold comps found (valid search)")
+        elif ebay_result['status'] == 'EBAY_THROTTLED':
+            ebay_throttled_count += 1
+            results.append({
+                'title': title,
+                'buy_price': sale_price,
+                'url': url,
+                'category': item_category,
+                'source_category': source_category,
+                'ebay_sold_count': None,
+                'ebay_avg_sold_price': None,
+                'ebay_median_sold_price': None,
+                'ebay_min_price': None,
+                'ebay_max_price': None,
+                'ebay_p25_price': None,
+                'ebay_p75_price': None,
+                'ebay_sample_items': None,
+                'ebay_last_sold_date': None,
+                'net_sale': 0,
+                'profit': 0,
+                'roi': 0,
+                'passed': False,
+                'status': 'pending',
+                'reason': 'EBAY_THROTTLED',
+                'fail_reason': 'eBay throttled; try again in a few minutes',
+                'mode': mode,
+                'fee_settings': {
+                    'ebay_fee_pct': ebay_fee_pct,
+                    'payment_fee_pct': payment_fee_pct,
+                    'shipping_flat': shipping_flat
+                }
+            })
+            print(f" → eBay throttled; stopping scan early (cooldown). Run again later.")
+            break
+        elif ebay_result['status'] == 'BUDGET_EXHAUSTED':
+            ebay_budget_exhausted_count += 1
+            results.append({
+                'title': title,
+                'buy_price': sale_price,
+                'url': url,
+                'category': item_category,
+                'source_category': source_category,
+                'ebay_sold_count': None,
+                'ebay_avg_sold_price': None,
+                'ebay_median_sold_price': None,
+                'ebay_min_price': None,
+                'ebay_max_price': None,
+                'ebay_p25_price': None,
+                'ebay_p75_price': None,
+                'ebay_sample_items': None,
+                'ebay_last_sold_date': None,
+                'net_sale': 0,
+                'profit': 0,
+                'roi': 0,
+                'passed': False,
+                'status': 'pending',
+                'reason': 'BUDGET_EXHAUSTED',
+                'fail_reason': 'eBay budget exhausted; run again later',
+                'mode': mode,
+                'fee_settings': {
+                    'ebay_fee_pct': ebay_fee_pct,
+                    'payment_fee_pct': payment_fee_pct,
+                    'shipping_flat': shipping_flat
+                }
+            })
+            print(f" → eBay budget exhausted; run again later")
+            break
+        elif ebay_result['status'] == 'API_FAIL':
+            ebay_api_fail_count += 1
+            results.append({
+                'title': title,
+                'buy_price': sale_price,
+                'url': url,
+                'category': item_category,
+                'source_category': source_category,
+                'ebay_sold_count': 0,
+                'ebay_avg_sold_price': 0,
+                'ebay_median_sold_price': 0,
+                'ebay_min_price': None,
+                'ebay_max_price': None,
+                'ebay_p25_price': None,
+                'ebay_p75_price': None,
+                'ebay_sample_items': [],
+                'ebay_last_sold_date': None,
+                'net_sale': 0,
+                'profit': 0,
+                'roi': 0,
+                'passed': False,
+                'status': 'failed',
+                'reason': 'API_FAIL',
+                'fail_reason': 'eBay API lookup failed',
+                'mode': mode,
+                'fee_settings': {
+                    'ebay_fee_pct': ebay_fee_pct,
+                    'payment_fee_pct': payment_fee_pct,
+                    'shipping_flat': shipping_flat
+                }
+            })
+            print(f" → FAIL: eBay API lookup failed")
+        elif ebay_result['status'] == 'LOW_CONFIDENCE_COMPS':
+            results.append({
+                'title': title,
+                'buy_price': sale_price,
+                'url': url,
+                'category': item_category,
+                'source_category': source_category,
+                'ebay_sold_count': ebay_result.get('sold_count', 0),
+                'ebay_avg_sold_price': ebay_result.get('avg_price', 0.0),
+                'ebay_median_sold_price': ebay_result.get('median_price', 0.0),
+                'ebay_trimmed_count': ebay_result.get('trimmed_count', 0),
+                'ebay_expected_sale_price': ebay_result.get('expected_sale_price', 0.0),
+                'ebay_min_price': ebay_result.get('min_price'),
+                'ebay_max_price': ebay_result.get('max_price'),
+                'ebay_p25_price': ebay_result.get('p25_price'),
+                'ebay_p75_price': ebay_result.get('p75_price'),
+                'ebay_sample_items': ebay_result.get('sample_items', []),
+                'ebay_last_sold_date': ebay_result.get('last_sold_date'),
+                'confidence_reason': ebay_result.get('confidence_reason'),
+                'net_sale': 0,
+                'profit': 0,
+                'roi': 0,
+                'passed': False,
+                'status': 'failed',
+                'reason': 'LOW_CONFIDENCE_COMPS',
+                'fail_reason': ebay_result.get('confidence_reason', 'Low confidence comps'),
+                'mode': mode,
+                'fee_settings': {
+                    'ebay_fee_pct': ebay_fee_pct,
+                    'payment_fee_pct': payment_fee_pct,
+                    'shipping_flat': shipping_flat
+                }
+            })
+            print(f" → FAIL: {ebay_result.get('confidence_reason', 'Low confidence comps')}")
+    
+    # Print summary
+    print()
+    print("=" * 80)
+    print("RESULTS")
+    print("=" * 80)
+    print()
+    
+    passed_results = [r for r in results if r.get('passed', False)]
+    failed_results = [r for r in results if not r.get('passed', False)]
+    passed_results.sort(key=lambda x: x.get('net_roi', 0), reverse=True)
+    
+    if passed_results:
+        print(f"✓ PASSED ({len(passed_results)} items):")
+        print("-" * 80)
+        for result in passed_results:
+            print(f"Title: {result['title']}")
+            print(f"  Buy Price: ${result['buy_price']:.2f}")
+            if result.get('ebay_avg_sold_price'):
+                print(f"  Avg Sold Price: ${result['ebay_avg_sold_price']:.2f}")
+            print(f"  Net Profit: ${result.get('net_profit', 0):.2f}")
+            print(f"  Net ROI: {result.get('net_roi', 0):.2%}")
+            if result.get('ebay_sold_count') is not None:
+                print(f"  Sold Count: {result['ebay_sold_count']}")
+            if result.get('url'):
+                print(f"  URL: {result['url']}")
+            print()
+    else:
+        print("No items passed the arbitrage criteria.")
+        print()
+    
+    print("Summary:")
+    print(f"  Accepted rows (title+price valid): {accepted_rows}")
+    print(f"  Attempted eBay lookups: {analyzed_count}")
+    print(f"  Cache hits: {_cache_hit_count}")
+    print(f"  Cache misses: {_cache_miss_count}")
+    print(f"  Passed: {passed_count}")
+    print(f"  Failed: {failed_criteria_count}")
+    
+    return results
+
+
+def process_upload_csv_with_save(infile: str, mode: str = 'highticket', ebay_fee_pct: float = EBAY_FEE_PCT, payment_fee_pct: float = PAYMENT_FEE_PCT, shipping_flat: float = SHIPPING_FLAT, run_id: Optional[str] = None, no_cache: bool = False):
+    """Wrapper that runs process_upload_csv_mode and saves results to file."""
+    results = process_upload_csv_mode(infile=infile, mode=mode, ebay_fee_pct=ebay_fee_pct, payment_fee_pct=payment_fee_pct, shipping_flat=shipping_flat, run_id=run_id, no_cache=no_cache)
+    
+    # Add scan_mode and run_id to all results before saving
+    for result in results:
+        result['scan_mode'] = mode
+        if run_id:
+            result['run_id'] = run_id
+    
+    save_deals_to_file(results)
+    
+    # Return analyzed count for validation (all results attempted eBay analysis in lenient upload mode)
+    analyzed_count = len(results)
+    return analyzed_count
+
+
 def process_woot_mode_with_save(category: str = 'Tools', limit: int = 10, resume: bool = False, stream: bool = False, brands: Optional[str] = None, mode: str = 'conservative', ebay_fee_pct: float = EBAY_FEE_PCT, payment_fee_pct: float = PAYMENT_FEE_PCT, shipping_flat: float = SHIPPING_FLAT, run_id: Optional[str] = None, no_cache: bool = False):
     """Wrapper that runs process_woot_mode and saves results to file."""
     results = process_woot_mode(category=category, limit=limit, resume=resume, stream=stream, brands=brands, mode=mode, ebay_fee_pct=ebay_fee_pct, payment_fee_pct=payment_fee_pct, shipping_flat=shipping_flat, no_cache=no_cache)
@@ -3500,8 +3932,9 @@ def main():
     
     # Backward compatibility: support old "woot" and "watchlist" as positional args
     # Note: This must come before subparsers to avoid conflicts
-    parser.add_argument('mode', nargs='?', default=None, choices=['woot', 'watchlist'],
-                       help='[DEPRECATED] Use "scan" or "view" subcommands instead')
+    # Remove choices restriction to allow subcommands like 'upload' to work
+    parser.add_argument('mode', nargs='?', default=None,
+                       help='[DEPRECATED] Use "scan" or "view" subcommands instead. Accepts: woot, watchlist')
     parser.add_argument('--category', default='Tools',
                        help='Woot feed category (default: Tools). Can be a single category or comma-separated list - for backward compatibility')
     parser.add_argument('--limit', type=int, default=10,
@@ -3575,6 +4008,25 @@ def main():
                             help='Use stored net_profit/net_roi values without recalculation')
     view_parser.add_argument('--no-cache', action='store_true',
                             help='Force live eBay API calls, ignore cached results (only affects view if it triggers new scans)')
+    
+    # upload subcommand
+    upload_parser = subparsers.add_parser('upload', help='Analyze uploaded CSV file through eBay arbitrage engine')
+    upload_parser.add_argument('--infile', type=str, required=True,
+                              help='Path to CSV file to analyze')
+    upload_parser.add_argument('--mode', type=str, choices=['conservative', 'active', 'highticket'], default='highticket',
+                              help='Scan mode (default: highticket)')
+    upload_parser.add_argument('--shipping-flat', type=float, default=SHIPPING_FLAT,
+                              help=f'Flat shipping cost (default: ${SHIPPING_FLAT})')
+    upload_parser.add_argument('--ebay-fee-pct', type=float, default=EBAY_FEE_PCT,
+                              help=f'eBay fee percentage (default: {EBAY_FEE_PCT})')
+    upload_parser.add_argument('--payment-fee-pct', type=float, default=PAYMENT_FEE_PCT,
+                              help=f'Payment processing fee percentage (default: {PAYMENT_FEE_PCT})')
+    upload_parser.add_argument('--outdir', type=str, default='data/reports',
+                              help='Output directory for CSV files (default: data/reports)')
+    upload_parser.add_argument('--allow-empty', action='store_true',
+                              help='Allow report generation even if scan analyzed 0 items')
+    upload_parser.add_argument('--no-cache', action='store_true',
+                              help='Force live eBay API calls, ignore cached results')
     
     # report subcommand
     report_parser = subparsers.add_parser('report', help='Run scan and export daily reports (passed, near-miss, all CSVs)')
@@ -3715,6 +4167,116 @@ def main():
                    near_roi=getattr(args, 'near_roi', 0.02),
                    near_comps=getattr(args, 'near_comps', 2),
                    recalc=getattr(args, 'recalc', True))
+    elif args.command == 'upload':
+        # Upload analyze command: analyze CSV file
+        from datetime import datetime
+        
+        mode_str = getattr(args, 'mode', 'highticket')
+        infile = getattr(args, 'infile', None)
+        ebay_fee_pct = getattr(args, 'ebay_fee_pct', EBAY_FEE_PCT)
+        payment_fee_pct = getattr(args, 'payment_fee_pct', PAYMENT_FEE_PCT)
+        shipping_flat = getattr(args, 'shipping_flat', SHIPPING_FLAT)
+        outdir = getattr(args, 'outdir', 'data/reports')
+        allow_empty = getattr(args, 'allow_empty', False)
+        no_cache = getattr(args, 'no_cache', False)
+        
+        if not infile:
+            print("ERROR: --infile is required")
+            sys.exit(1)
+        
+        if not os.path.exists(infile):
+            print(f"ERROR: CSV file not found: {infile}")
+            sys.exit(1)
+        
+        # Create output directory
+        os.makedirs(outdir, exist_ok=True)
+        
+        # Generate run_id and date stamp
+        now = datetime.now()
+        run_id = now.strftime('%Y-%m-%d_%H%M%S')
+        date_stamp = now.strftime('%Y-%m-%d')
+        
+        # Run analysis
+        analyzed_count = process_upload_csv_with_save(
+            infile=infile,
+            mode=mode_str,
+            ebay_fee_pct=ebay_fee_pct,
+            payment_fee_pct=payment_fee_pct,
+            shipping_flat=shipping_flat,
+            run_id=run_id,
+            no_cache=no_cache
+        )
+        print()
+        
+        # Check if analyzed 0 items
+        if analyzed_count == 0:
+            print("=" * 80)
+            print("⚠️  WARNING: Analysis processed 0 items!")
+            print("=" * 80)
+            print()
+            if not allow_empty:
+                print("Exiting with error code. Use --allow-empty to generate report anyway.")
+                print("=" * 80)
+                sys.exit(1)
+            else:
+                print("Continuing because --allow-empty flag was set.")
+                print("=" * 80)
+                print()
+        
+        # Export CSVs
+        print("Exporting CSVs (run-scoped)...")
+        
+        passed_csv = os.path.join(outdir, f"passed-{date_stamp}.csv")
+        view_deals(
+            top=0,
+            mode_filter=mode_str,
+            run_id_filter=run_id,
+            ebay_fee_pct=ebay_fee_pct,
+            payment_fee_pct=payment_fee_pct,
+            shipping_flat=shipping_flat,
+            export_csv=passed_csv,
+            recalc=True,
+            quiet=True
+        )
+        print(f"✓ Exported passed deals to: {passed_csv}")
+        
+        nearmiss_csv = os.path.join(outdir, f"nearmiss-{date_stamp}.csv")
+        view_deals(
+            top=0,
+            mode_filter=mode_str,
+            run_id_filter=run_id,
+            ebay_fee_pct=ebay_fee_pct,
+            payment_fee_pct=payment_fee_pct,
+            shipping_flat=shipping_flat,
+            export_csv=nearmiss_csv,
+            near_miss=True,
+            recalc=True,
+            quiet=True
+        )
+        print(f"✓ Exported near-miss deals to: {nearmiss_csv}")
+        
+        all_csv = os.path.join(outdir, f"all-{date_stamp}.csv")
+        view_deals(
+            top=0,
+            mode_filter=mode_str,
+            run_id_filter=run_id,
+            ebay_fee_pct=ebay_fee_pct,
+            payment_fee_pct=payment_fee_pct,
+            shipping_flat=shipping_flat,
+            export_csv=all_csv,
+            show_all=True,
+            recalc=True,
+            quiet=True
+        )
+        print(f"✓ Exported all deals to: {all_csv}")
+        
+        print()
+        print("=" * 80)
+        print("Analysis complete!")
+        print(f"Run ID: {run_id}")
+        print(f"Items analyzed: {analyzed_count}")
+        print(f"Output directory: {outdir}")
+        print("=" * 80)
     elif args.command == 'report':
         # Report command: run scan then export CSVs
         from datetime import datetime

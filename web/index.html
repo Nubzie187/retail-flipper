@@ -1,0 +1,73 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Retail Flipper — Scan Deals</title>
+    <link rel="stylesheet" href="/web/styles.css">
+</head>
+<body>
+    <div class="container">
+        <header>
+            <h1>Retail Flipper — Scan Deals</h1>
+        </header>
+
+        <div class="upload-section">
+            <h2>Upload Deals (CSV)</h2>
+            <div class="upload-controls">
+                <label>
+                    <span>CSV File</span>
+                    <input type="file" id="uploadCsv" accept=".csv">
+                </label>
+                <button id="scanUploadBtn" class="scan-button">Scan Upload</button>
+                <div id="uploadStatus"></div>
+                <small style="color: #7f8c8d; font-size: 12px; margin-top: 5px; display: block;">Requires columns: title, price (optional: url, store, category, sku, image_url)</small>
+                <small id="uploadBrandNote" style="color: #856404; font-size: 12px; margin-top: 5px; display: none; font-style: italic;">Brand filter disabled for uploads</small>
+            </div>
+        </div>
+
+        <div class="controls">
+            <label>
+                <span>Items to scan</span>
+                <input type="number" id="limitInput" min="1" max="500" step="10" value="120">
+            </label>
+            <label>
+                <span>Categories</span>
+                <select multiple id="categorySelect">
+                    <option value="Tools" selected>Tools</option>
+                    <option value="Electronics" selected>Electronics</option>
+                    <option value="Computers">Computers</option>
+                    <option value="Home">Home</option>
+                    <option value="Outdoor">Outdoor</option>
+                    <option value="Automotive">Automotive</option>
+                </select>
+                <small>Hold Ctrl (Cmd on Mac) to select multiple</small>
+            </label>
+            <label style="display: flex; align-items: center; gap: 8px;">
+                <input type="checkbox" id="brandsEnabled" checked>
+                <span>Apply brand filter</span>
+            </label>
+            <button id="scanBtn" class="scan-button">Scan Deals</button>
+            <div id="status"></div>
+            <small style="color: #7f8c8d; font-size: 12px; margin-top: 5px; display: block;">New scans replace results unless items are pinned.</small>
+        </div>
+
+        <div class="tabs">
+            <button class="tab-btn active" data-type="passed" id="tab-passed">Passed (0)</button>
+            <button class="tab-btn" data-type="nearmiss" id="tab-nearmiss">Near-miss (0)</button>
+            <button class="tab-btn" data-type="all" id="tab-all">All (0)</button>
+        </div>
+
+        <div id="banner" style="display: none; background: #fff3cd; border: 1px solid #ffc107; padding: 10px 15px; border-radius: 6px; margin-bottom: 20px; color: #856404;">
+            <strong>0 passed</strong> — showing All
+        </div>
+
+        <div id="cards" class="cards-grid">
+            <div class="empty-state">Click "Scan Deals" to run a report</div>
+        </div>
+    </div>
+
+    <script src="/web/app.js"></script>
+</body>
+</html>
+
