@@ -1,0 +1,62 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Retail Flipper — Report Viewer</title>
+    <link rel="stylesheet" href="styles.css">
+    <script src="https://cdn.jsdelivr.net/npm/papaparse@5.4.1/papaparse.min.js"></script>
+</head>
+<body>
+    <div class="container">
+        <header>
+            <h1>Retail Flipper — Report Viewer</h1>
+        </header>
+
+        <div class="controls">
+            <div class="control-group">
+                <label for="file-input" class="file-label">
+                    <span>Load CSV</span>
+                    <input type="file" id="file-input" accept=".csv" hidden>
+                </label>
+            </div>
+
+            <div class="tabs">
+                <button class="tab-btn active" data-tab="passed">PASSED</button>
+                <button class="tab-btn" data-tab="nearmiss">NEARMISS</button>
+                <button class="tab-btn" data-tab="all">ALL</button>
+            </div>
+
+            <div class="control-group">
+                <input type="text" id="search-input" placeholder="Search title / brand / category…" class="search-input">
+            </div>
+
+            <div class="control-group">
+                <select id="sort-select" class="sort-select">
+                    <option value="profit-desc">Profit (desc)</option>
+                    <option value="roi-desc">ROI (desc)</option>
+                    <option value="sold_comps-desc">Sold comps (desc)</option>
+                    <option value="price-desc">Price (desc)</option>
+                </select>
+            </div>
+
+            <div class="control-group" id="category-group" style="display: none;">
+                <select id="category-select" class="category-select">
+                    <option value="">All Categories</option>
+                </select>
+            </div>
+        </div>
+
+        <div class="summary" id="summary">
+            <span>No data loaded</span>
+        </div>
+
+        <div class="cards-grid" id="cards-grid">
+            <div class="empty-state">Load a CSV file to view reports</div>
+        </div>
+    </div>
+
+    <script src="app.js"></script>
+</body>
+</html>
+
